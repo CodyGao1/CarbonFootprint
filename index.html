@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Dynamic Location Selector</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script>
+      let map, markersArray = [], locations = [], placeNames = [], transportModes = [], labelIndex = 1, totalCarbonFootprint = 0, polylinesArray = [];
+      const openaiApiKey = 'OPENAI API KEY OMMITTED FOR SECURITY';
+      function initMap() {
+        map = new google.maps.Map(document.getElementById("map"), { center: { lat: 39.8283, lng: -98.5795 }, zoom: 5 });
+        const input = document.getElementById("search-bar");
+        const searchBox = new google.maps.places.SearchBox(input);
+        const geocoder = new google.maps.Geocoder();
+        map.addListener("bounds_changed", () => { searchBox.setBounds(map.getBounds()); });
+        searchBox.addListener("places_changed", () => {
+          const place = searchBox.getPlaces()[0];
+          if (place.geometry) {
+            addLocation(place.geometry.location, place.name);
+            map.panTo(place.geometry.location);
+            map.setZoom(15);
+          }
+        });
+        map.addListener("click", event => {
+          geocoder.geocode({ location: event.latLng }, (results, status) => {
+            addLocation(event.latLng, status === 'OK' && results[0] ? results[0].formatted_address : `Point ${labelIndex}`);
+          });
+        });
+      }
+      function addLocation(latLng, placeName) {
+        const marker = new google.maps.Marker({ position: latLng, map, label: labelIndex.toString() });
+        markersArray.push(marker);
+        locations.push(latLng);
+        placeNames.push(placeName);
+        if (locations.length > 1) {
+          const mode = prompt("Enter mode (DRIVING, WALKING, BICYCLING, BUS, METRO):").toUpperCase();
+          if (["DRIVING", "WALKING", "BICYCLING", "BUS", "METRO"].includes(mode)) {
+            transportModes.push(mode);
+            updatePathfinding();
+          }
+        } else {
+          transportModes.push(null);
+        }
+        labelIndex++;
+      }
+      function updatePathfinding() {
+        if (locations.length < 2) return;
+        const mode = transportModes[transportModes.length - 1];
+        const directionsService = new google.maps.DirectionsService();
+        const travelMode = ["BUS", "METRO"].includes(mode) ? "TRANSIT" : mode;
+        const transitOptions = mode === "BUS" ? { modes: ["BUS"] } : mode === "METRO" ? { modes: ["RAIL"] } : null;
+        directionsService.route({
+          origin: locations[locations.length - 2],
+          destination: locations[locations.length - 1],
+          travelMode: travelMode,
+          transitOptions: transitOptions,
+        }, (result, status) => {
+          if (status === 'OK') {
+            const distanceText = result.routes[0].legs[0].distance.text;
+            const duration = result.routes[0].legs[0].duration.text;
+            const distanceKm = parseFloat(distanceText.replace(/[^0-9.]/g, ""));
+            const emissions = calculateEmissions(mode, distanceKm);
+            totalCarbonFootprint += emissions;
+            const from = placeNames[placeNames.length - 2];
+            const to = placeNames[placeNames.length - 1];
+            document.getElementById("response").innerHTML += `<div>${from} to ${to}: ${distanceText} (${duration}) via ${mode}, ${emissions.toFixed(2)} g CO₂</div>`;
+            document.getElementById("total-carbon-footprint").innerText = `${totalCarbonFootprint.toFixed(2)} g CO₂`;
+            const path = result.routes[0].overview_path;
+            const polyline = new google.maps.Polyline({
+              path: path,
+              geodesic: true,
+              strokeColor: getColorForEmissions(emissions),
+              strokeOpacity: 1.0,
+              strokeWeight: 4,
+              map: map,
+            });
+            polylinesArray.push(polyline);
+          }
+        });
+      }
+      function getColorForEmissions(emissions) {
+        const maxEmissions = 1000;
+        const ratio = Math.min(emissions / maxEmissions, 1);
+        const red = Math.floor(255 * ratio);
+        const green = Math.floor(255 * (1 - ratio));
+        return `rgb(${red},${green},0)`;
+      }
+      function calculateEmissions(mode, distance) {
+        const rates = { DRIVING: 250, WALKING: 0, BICYCLING: 0, BUS: 90, METRO: 20 };
+        return rates[mode] * distance;
+      }
+      function getRecommendations() {
+        const details = Array.from(document.getElementById("response").querySelectorAll("div")).map(div => div.textContent).join("\n");
+        const prompt = `My routes:\n${details}\nTotal CO2: ${totalCarbonFootprint.toFixed(2)} g. US average is 12,600 g/day. Provide realistic advice to reduce CO2 emissions.`;
+        fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${openaiApiKey}` },
+          body: JSON.stringify({ model: 'gpt-4', messages: [{ role: 'user', content: prompt }] }),
+        }).then(response => response.json()).then(data => {
+          document.getElementById("gpt-response").innerText = data.choices[0].message.content;
+        });
+      }
+      function downloadPDF() {
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF();
+        const margin = 10;
+        const pageWidth = doc.internal.pageSize.width;
+        const textWidth = pageWidth - margin * 2;
+        let y = 10;
+        doc.setFontSize(16).text("Route Details:", margin, y);
+        y += 10;
+        doc.setFontSize(12).splitTextToSize(document.getElementById("response").innerText, textWidth).forEach(line => {
+          if (y > 280) { doc.addPage(); y = 10; }
+          doc.text(line, margin, y); y += 7;
+        });
+        y += 10;
+        doc.setFontSize(16).text("Total Carbon Footprint:", margin, y);
+        y += 10;
+        doc.setFontSize(12).text(`${totalCarbonFootprint.toFixed(2)} g CO₂`, margin, y);
+        y += 20;
+        doc.setFontSize(16).text("AI Assistant Recommendations:", margin, y);
+        y += 10;
+        doc.setFontSize(12).splitTextToSize(document.getElementById("gpt-response").innerText, textWidth).forEach(line => {
+          if (y > 280) { doc.addPage(); y = 10; }
+          doc.text(line, margin, y); y += 7;
+        });
+        doc.save('carbon_footprint_report.pdf');
+      }
+      function clearRoutes() {
+        markersArray.forEach(marker => marker.setMap(null));
+        markersArray = [];
+        polylinesArray.forEach(polyline => polyline.setMap(null));
+        polylinesArray = [];
+        locations = [];
+        placeNames = [];
+        transportModes = [];
+        labelIndex = 1;
+        totalCarbonFootprint = 0;
+        document.getElementById("response").innerHTML = '';
+        document.getElementById("total-carbon-footprint").innerText = '0 g CO₂';
+        document.getElementById("gpt-response").innerText = '';
+      }
+    </script>
+  </head>
+  <body>
+    <div id="search-container">
+      <input id="search-bar" type="text" placeholder="Enter an address..." />
+    </div>
+    <div id="map"></div>
+    <div id="controls">
+      <button onclick="downloadPDF()">Download PDF</button>
+      <button onclick="getRecommendations()">Get Recommendations</button>
+      <button onclick="clearRoutes()">Clear Routes</button>
+      <h3>Route Details</h3>
+      <div id="response"></div>
+      <h3>Total Carbon Footprint</h3>
+      <p id="total-carbon-footprint">0 g CO₂</p>
+      <h3>AI Recommendations</h3>
+      <div id="gpt-response"></div>
+    </div>
+    <script src="https://maps.googleapis.com/maps/api/js?key=GOOGLE MAPS API KEY OMMITTED FOR SECURITY&callback=initMap&libraries=places&v=weekly" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  </body>
+</html>
+
